@@ -4,6 +4,7 @@
 *.Jason
 *.csv
 *.gz
+*.xlsx.bak*
 # Virtual environments
 .edgar_cache/
 venv/
