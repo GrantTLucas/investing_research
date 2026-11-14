@@ -2,6 +2,7 @@
 *.conf
 *.json
 *.Jason
+*.csv
 
 # Virtual environments
 venv/
