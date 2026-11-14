@@ -41,7 +41,7 @@ R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 API = "https://data.sec.gov"
 SITE = "https://www.sec.gov"
 SEC_FORMS = {"10-Q", "10-K"}
-CELL_RE = re.compile(r'<c\b[^>]*\br="([A-Z]+)(\d+)"[^>]*(?:/>|>.*?</c>)', re.S)
+CELL_RE = re.compile(r'<c\b[^>]*?\br="([A-Z]+)(\d+)"[^>]*?(?:\s*/>|>.*?</c>)', re.S)
 FORMULA_REF = re.compile(r'(?<![A-Za-z0-9_])(?P<colabs>\$?)(?P<col>[A-Z]{1,3})(?P<rowabs>\$?)(?P<row>[1-9][0-9]{0,6})(?![A-Za-z0-9_])')
 CHANGE_HEADER = {'quarter': 'QoQ %', 'annual': 'YoY %'}
 
@@ -561,6 +561,8 @@ class XMLSheet:
         self.styles: dict[tuple[int, int], str] = {}
         self.pending: dict[tuple[int, int], tuple[str, object]] = {}
         self.percent_style = None
+        self.report_styles = {}
+        self.row_roles = {}
         self.layout_changed = False
         self._read()
 
@@ -720,7 +722,8 @@ class XMLSheet:
             text = escape(str(value), {'"': '&quot;'})
             return f'<c r="{address}"{s} t="inlineStr"><is><t>{text}</t></is></c>'
         if kind == "f":
-            style_id = self.percent_style
+            style_id = (self.report_styles.get(('total_percent' if self.row_roles.get(row) == 'grand' else 'subtotal_percent' if self.row_roles.get(row) == 'subtotal' else 'review_percent' if self.row_roles.get(row) == 'review' else 'percent'))
+                        if self.report_styles else self.percent_style)
             pct_style = f' s="{style_id}"' if style_id is not None else s
             return f'<c r="{address}"{pct_style}><f>{escape(str(value))}</f><v></v></c>'
         if isinstance(value, Decimal):
@@ -916,8 +919,10 @@ class Workbook:
             with ZipFile(path) as z:
                 self.raw = {name: z.read(name) for name in z.namelist()}
         self.percent_style = None
+        self.report_styles = {}
         if "xl/styles.xml" in self.raw:
             self.raw["xl/styles.xml"], self.percent_style = _ensure_percent_style(self.raw["xl/styles.xml"])
+            self.raw["xl/styles.xml"], self.report_styles = report_styles(self.raw["xl/styles.xml"])
         # Recalculate newly written change formulas when Excel opens the file.
         if "xl/workbook.xml" in self.raw:
             xml = self.raw["xl/workbook.xml"].decode("utf-8")
@@ -941,20 +946,15 @@ class Workbook:
             self.paths[name] = target
             self.sheets[name] = XMLSheet(self.raw[target].decode("utf-8"), shared, name)
             self.sheets[name].percent_style = self.percent_style
+            self.sheets[name].report_styles = self.report_styles
 
     def changed(self) -> bool:
         return self.is_placeholder or any(sheet.pending or sheet.layout_changed for sheet in self.sheets.values())
 
-    def save(self, *, dry_run=False, backup=True) -> None:
-        if dry_run or not self.changed(): return
+    def save(self, *, dry_run=False, backup=True) -> bool:
+        if dry_run or not self.changed(): return False
         if self.is_placeholder and self.path.stat().st_size != 0:
             raise ValueError(f"Refusing to overwrite {self.path}: placeholder was modified by another process")
-        if backup and not self.is_placeholder:
-            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup_path = self.path.with_name(self.path.name + f".bak.{stamp}")
-            if backup_path.exists(): backup_path = self.path.with_name(self.path.name + f".bak.{stamp}-{os.getpid()}")
-            shutil.copy2(self.path, backup_path)
-            LOG.info("Backup %s", backup_path)
         fd, filename = tempfile.mkstemp(suffix=".xlsx", dir=self.path.parent)
         os.close(fd)
         try:
@@ -979,9 +979,584 @@ class Workbook:
             with ZipFile(filename) as test:
                 if test.testzip() is not None: raise ValueError("Broken ZIP archive produced")
                 for path in self.paths.values(): ET.fromstring(test.read(path))
+            if not self.is_placeholder and Path(filename).read_bytes() == self.path.read_bytes():
+                return False  # Idempotent reformat must not create repeated backups.
+            if backup and not self.is_placeholder:
+                stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                backup_path = self.path.with_name(self.path.name + f".bak.{stamp}")
+                if backup_path.exists():
+                    backup_path = self.path.with_name(self.path.name + f".bak.{stamp}-{os.getpid()}")
+                shutil.copy2(self.path, backup_path)
+                LOG.info("Backup %s", backup_path)
             os.replace(filename, self.path)
+            return True
         finally:
             if os.path.exists(filename): os.unlink(filename)
+
+
+# Canonical presentation is intentionally an analytical presentation, not an assertion
+# that every SEC registrant is required to use a single GAAP account order.
+REPORT_LAYOUT_VERSION = 3
+REPORT_STYLE_MARKER = 'EDGAR_REPORT_STYLES_V2'
+REPORT_COLORS = {
+    'navy': '17324D', 'soft': 'E8F0F8', 'total': 'D7E5F2',
+    'review': 'FFF0CB', 'muted': '49647C', 'blue': '1E40AF',
+}
+
+
+def report_styles(styles: bytes) -> tuple[bytes, dict[str, int]]:
+    """Add reusable OOXML cell styles, returning the existing indices on later runs."""
+    data = styles.decode('utf-8')
+    marker = re.search(r'<!-- ' + REPORT_STYLE_MARKER + r' (\{[^<]+\}) -->', data)
+    if marker:
+        return styles, {name: int(index) for name, index in json.loads(marker[1]).items()}
+    root = ET.fromstring(data)
+    def count(name):
+        parent = root.find('{%s}%s' % (M, name))
+        if parent is None: raise ValueError('Unsupported XLSX styles.xml: missing ' + name)
+        return len(parent)
+    font_start, fill_start, border_start, xf_start = (count(s) for s in ('fonts', 'fills', 'borders', 'cellXfs'))
+    fmt_ids = [int(n.get('numFmtId')) for n in root.findall('.//{%s}numFmt' % M) if n.get('numFmtId')]
+    fmt_start = max([163, *fmt_ids]) + 1
+    fmts = {
+        'number': '#,##0.00;[Red](#,##0.00);"–"',
+        'per_share': '0.0000;[Red](0.0000);"–"',
+        'percent': '0.0%;[Red](0.0%);"–"',
+    }
+    from xml.sax.saxutils import quoteattr
+    formats_xml = ''.join(f'<numFmt numFmtId="{fmt_start+i}" formatCode={quoteattr(fmt)}/>'
+                          for i, fmt in enumerate(fmts.values()))
+    if '<numFmts' in data:
+        data = re.sub(r'(<numFmts\b[^>]*\bcount=")[0-9]+(")',
+                      lambda m: m[1] + str(count('numFmts') + len(fmts)) + m[2], data, count=1)
+        data = data.replace('</numFmts>', formats_xml + '</numFmts>', 1)
+    else:
+        data = data.replace('<fonts', f'<numFmts count="{len(fmts)}">{formats_xml}</numFmts><fonts', 1)
+    new_fonts = [
+        '<font><sz val="10"/><name val="Aptos"/><color rgb="FF25384A"/></font>',
+        '<font><sz val="10"/><name val="Aptos"/><color rgb="FF1E40AF"/></font>',
+        '<font><b/><sz val="10"/><name val="Aptos"/><color rgb="FFFFFFFF"/></font>',
+        '<font><b/><sz val="10"/><name val="Aptos"/><color rgb="FF17324D"/></font>',
+        '<font><b/><sz val="10"/><name val="Aptos"/><color rgb="FF49647C"/></font>',
+    ]
+    new_fills = [
+        f'<fill><patternFill patternType="solid"><fgColor rgb="FF{REPORT_COLORS[c]}"/><bgColor indexed="64"/></patternFill></fill>'
+        for c in ('navy', 'soft', 'total', 'review')
+    ]
+    new_borders = [
+        '<border><left/><right/><top style="thin"><color rgb="FF8EA4B9"/></top><bottom/><diagonal/></border>',
+        '<border><left/><right/><top style="medium"><color rgb="FF17324D"/></top><bottom style="double"><color rgb="FF17324D"/></bottom><diagonal/></border>',
+    ]
+    def insert_collection(name, start, addition):
+        nonlocal data
+        data = re.sub(r'(<'+name+r'\b[^>]*\bcount=")[0-9]+(")',
+                      lambda m: m[1] + str(start + len(addition)) + m[2], data, count=1)
+        data = data.replace('</'+name+'>', ''.join(addition) + '</'+name+'>', 1)
+    insert_collection('fonts', font_start, new_fonts)
+    insert_collection('fills', fill_start, new_fills)
+    insert_collection('borders', border_start, new_borders)
+    # Styles have separate variants for headings, details, subtotals and grand totals.
+    rules = {
+        'label':           (0, 0, 0, 0, 0),
+        'number':          (1, 0, 0, fmt_start, 0),
+        'per_share':       (1, 0, 0, fmt_start+1, 0),
+        'percent':         (0, 0, 0, fmt_start+2, 0),
+        'header_label':    (2, 0, 0, 0, 0),
+        'header_number':   (2, 0, 0, 0, 0),
+        'section_label':   (2, 0, 0, 0, 0),
+        'section_number':  (2, 0, 0, 0, 0),
+        'subtotal_label':  (3, 1, 0, 0, 1),
+        'subtotal_number': (3, 1, 0, fmt_start, 1),
+        'subtotal_percent':(3, 1, 0, fmt_start+2, 1),
+        'total_label':     (3, 2, 1, 0, 1),
+        'total_number':    (3, 2, 1, fmt_start, 1),
+        'total_percent':   (3, 2, 1, fmt_start+2, 1),
+        'review_label':    (4, 3, 0, 0, 0),
+        'review_number':   (1, 3, 0, fmt_start, 0),
+        'review_percent':  (0, 3, 0, fmt_start+2, 0),
+    }
+    # Rules' font/fill/border coordinates above are relative to newly appended collections.
+    # Use a common minimal cellXf to avoid inheriting a company's custom number format.
+    new_xfs = []
+    result = {}
+    for index, (name, (font, fill, border, num_fmt, align)) in enumerate(rules.items()):
+        result[name] = xf_start + index
+        alignment = ('<alignment horizontal="right"/>' if name.endswith(('number', 'percent'))
+                     or name == 'per_share' else '<alignment horizontal="left"/>')
+        attrs = (f'numFmtId="{num_fmt}" fontId="{font_start+font}" '
+                 f'fillId="{0 if name in ("label","number","per_share","percent") else fill_start+fill}" borderId="{border_start+border}" '
+                 'xfId="0" applyFont="1" applyFill="1" applyBorder="1" '
+                 'applyNumberFormat="1" applyAlignment="1"')
+        new_xfs.append(f'<xf {attrs}>{alignment}</xf>')
+    insert_collection('cellXfs', xf_start, new_xfs)
+    data = data.replace('</styleSheet>',
+                        '<!-- '+REPORT_STYLE_MARKER+' '+json.dumps(result, separators=(',',':'))+' -->'
+                        '</styleSheet>', 1)
+    ET.fromstring(data)
+    return data.encode('utf-8'), result
+
+
+# These are classification rules for analytical spreads, not a replacement for a
+# registrant's GAAP notes. Companies with unclassified balance sheets are not
+# assigned arbitrary current/noncurrent totals.
+def _item_kind(label: str, typ: str) -> str:
+    key = norm(label)
+    if 'reconciliation' in key or 'less reported total' in key or any(token in key for token in CHECK_TOKENS): return 'check'
+    if typ == 'balance':
+        if (key.startswith('total liabilities') and ('equity' in key or 'stockholders' in key or
+                                                    'shareholders' in key)): return 'grand'
+        if key in ('total assets', 'total liabilities', 'total equity', 'total stockholders equity',
+                   'total shareholders equity', 'total equity including noncontrolling interests'): return 'grand'
+        if key.startswith('total ') or key.startswith('net investment in real estate') and False: return 'subtotal'
+    elif typ == 'income':
+        if (key.startswith('net income') or key.startswith('net earnings') or
+                key.startswith('profit loss') or key.startswith('total net income')): return 'grand'
+        if (key.startswith('total ') or 'gross profit' in key or
+                key.startswith('operating income') or key.startswith('income loss from operations') or
+                'before income taxes' in key or 'before taxes' in key): return 'subtotal'
+    elif typ == 'cashflow':
+        if ('cash and cash equivalents end' in key or 'cash cash equivalents and restricted cash end' in key or
+                key.startswith('cash at end') or 'cash at end of period' in key): return 'grand'
+        if ((key.startswith('net cash') or key.startswith('cash flows from')) and any(x in key for x in
+                ('operating activities','investing activities','financing activities'))): return 'subtotal'
+        if key.startswith('net increase decrease in cash') or key.startswith('net change in cash'): return 'subtotal'
+    return 'detail'
+
+
+def _sort_priority(label: str, typ: str, group: str) -> tuple[int, str]:
+    k = norm(label)
+    def first(matches):
+        for index, pattern in enumerate(matches):
+            if re.search(pattern, k): return index
+        return len(matches)
+    if typ == 'balance':
+        if group.startswith('asset'):
+            patterns = [r'cash and cash equivalents', r'cash .* segregated', r'restricted cash',
+                        r'short term investment', r'marketab', r'securities borrowed',
+                        r'receiv', r'deposit', r'inventor', r'prepaid', r'deferred',
+                        r'property', r'land', r'real estate', r'building', r'development',
+                        r'investment', r'intangible', r'goodwill', r'lease', r'other']
+        elif group.startswith('liab'):
+            patterns = [r'accounts payable', r'payable', r'accrued', r'securities loaned',
+                        r'deferred revenue', r'unearned', r'customer', r'lease',
+                        r'mortgage', r'borrow', r'loan', r'debt', r'reserve', r'tax', r'other']
+        else:
+            patterns = [r'common stock', r'preferred stock', r'additional paid', r'treasury',
+                        r'retained', r'accumulated deficit', r'comprehensive', r'noncontrolling',r'other']
+    elif typ == 'income':
+        patterns = ([r'transaction',r'product',r'service',r'subscription',r'rental',
+                     r'land',r'premium',r'interest',r'other'] if group=='revenue' else
+                    [r'cost of sales',r'cost of revenue',r'operating costs',r'claim',
+                     r'brokerage',r'technology',r'operation',r'marketing',
+                     r'general and administrative',r'depreciation',r'other'])
+    else:
+        patterns = [r'net income',r'depreciation',r'amortization',r'stock based',r'deferred',
+                    r'gain',r'loss',r'accounts receivable',r'accounts payable',
+                    r'change',r'purchase',r'proceeds',r'payment',r'other']
+    return first(patterns), k
+
+
+def _is_heading(label: str) -> bool:
+    k = norm(label)
+    return k in {
+        'assets','liabilities','equity','stockholders equity','shareholders equity',
+        'current assets','noncurrent assets','current liabilities','noncurrent liabilities',
+        'revenues','revenue','income','expenses','operating expenses','other',
+        'other income and taxes','other income expenses','other income expense',
+        'cash flows from operating activities','cash flows from investing activities',
+        'cash flows from financing activities','operating activities', 'investing activities',
+        'financing activities', 'earnings per share usd share','earnings per share',
+        'weighted average shares outstanding millions','weighted average shares outstanding',
+        'supplemental equity detail reconciliations','supplemental equity detail and reconciliations','reconciliation checks all should equal zero',
+        'additional sec line items review','uncategorized items requiring review',
+        'supplemental cash flow information', 'operating expenses and other costs',
+        'cost of revenue', 'gross profit', 'operating profit', 'pretax income',
+        'net income','income taxes','other income and expenses', 'weighted average shares',
+        'cash reconciliation','supplemental disclosures','reconciliation checks',
+        'mezzanine equity',
+    }
+
+
+def _balance_bucket(label: str, context: str, current: str, has_current_assets: bool,
+                    has_current_liab: bool) -> str:
+    k = norm(label)
+    if 'reconciliation' in k or 'less reported total' in k or 'component sum difference' in k or any(t in k for t in CHECK_TOKENS): return 'checks'
+    if k.startswith('assets liabilities') or 'assets less liabilities' in k: return 'checks'
+    if 'total liabilities' in k and ('equity' in k or 'stockholders' in k or 'shareholders' in k):
+        return 'balance_total'
+    if k in ('total assets','total asset'): return 'assets_total'
+    if k in ('total liabilities',): return 'liab_total'
+    if k in ('total current assets',): return 'assets_current'
+    if k in ('total current liabilities',): return 'liab_current'
+    if k.startswith('total ') and ('stockholders equity' in k or 'shareholders equity' in k or k=='total equity'):
+        return 'equity'
+    if 'mezzanine equity' in k or 'redeemable noncontrolling' in k: return 'mezzanine'
+    if context == 'review':
+        if any(t in k for t in ('asset','receivable','cash and cash','investment','property','goodwill','intangible','deposit','inventory')):
+            context = 'assets'
+        elif any(t in k for t in ('liability','payable','debt','borrowing','lease obligation','accrued')):
+            context = 'liab'
+        elif any(t in k for t in ('equity','stock','retained earnings','accumulated deficit','noncontrolling')):
+            context = 'equity'
+        else: return 'review'
+    if context == 'assets' and ('equity securit' in k or 'equity method investment' in k or
+                                'investments in equity' in k):
+        return 'assets_noncurrent' if has_current_assets and current=='noncurrent' else 'assets_other'
+    if ('equity' in k or 'stockholders' in k or 'shareholders' in k or
+            'noncontrolling interests' in k or 'retained earnings' in k or
+            'paid in capital' in k or 'accumulated comprehensive' in k or 'accumulated deficit' in k or
+            'treasury stock' in k or 'common stock' in k): return 'equity'
+    if context in ('assets','liab','equity'):
+        if context == 'assets':
+            if has_current_assets:
+                if 'noncurrent' in k or 'non current' in k: return 'assets_noncurrent'
+                if 'current' in k or current == 'current': return 'assets_current'
+                return 'assets_noncurrent'
+            return 'assets_other'
+        if context == 'liab':
+            if has_current_liab:
+                if 'noncurrent' in k or 'non current' in k: return 'liab_noncurrent'
+                if 'current' in k or current == 'current': return 'liab_current'
+                return 'liab_noncurrent'
+            return 'liab_other'
+        return 'equity'
+    return 'review'
+
+
+def _income_bucket(label: str, context: str) -> str:
+    k = norm(label)
+    if 'reconciliation' in k or any(t in k for t in CHECK_TOKENS): return 'checks'
+    if ('weighted average' in k or 'weighted average shares' in k): return 'shares'
+    if ('earnings per share' in k or 'income per share' in k or
+            re.search(r'^(basic|diluted) (net )?(earnings|income|loss) per share', k)): return 'eps'
+    if ('noncontrolling' in k and ('net income' in k or 'net earnings' in k)): return 'netincome'
+    if ('net income' in k or 'net earnings' in k or 'net loss' in k or
+            'profit loss' == k): return 'netincome'
+    if ('before taxes' in k or 'before income taxes' in k or 'income before tax' in k or
+            'earnings before tax' in k): return 'pretax'
+    if ('income tax' in k or 'tax expense' in k or 'benefit from taxes' in k): return 'taxes'
+    if ('operating income' in k or 'income loss from operations' in k or
+            'income from operations' in k or 'operating profit' in k): return 'operating_profit'
+    if ('gross profit' in k or 'gross margin' in k): return 'gross'
+    if ('cost of sales' in k or 'cost of revenue' in k or 'cost of goods' in k or
+            'cost of services' in k): return 'cost'
+    if ('total operating expense' in k or 'total expense' in k or 'total costs' in k): return 'opex'
+    if ('interest expense' in k or 'interest income' in k or 'interest revenue' in k and context != 'revenue'
+        or 'sale or disposal' in k or 'extinguishment' in k or 'equity in earnings' in k or
+        'investment gain' in k or 'other income' in k or 'total other' in k):
+        return 'nonop' if context != 'revenue' else 'revenue'
+    if ('total revenue' in k or 'net revenues' in k or 'total net revenue' in k): return 'revenue'
+    if context == 'review':
+        if any(t in k for t in ('revenue','sales','premium','land sales','rental')): return 'revenue'
+        if any(t in k for t in ('expense','cost','marketing','research','development')): return 'opex'
+        return 'review'
+    return context if context in ('revenue','cost','opex','nonop') else 'review'
+
+
+def _cashflow_bucket(label: str, context: str) -> str:
+    k = norm(label)
+    if ('net increase' in k or 'net decrease' in k or 'net change' in k or
+            'effect of exchange rate' in k or 'effect of foreign exchange' in k or
+            'cash and cash equivalents' in k and ('beginning' in k or 'end of' in k)): return 'reconciliation'
+    for group in ('operating','investing','financing'):
+        if group+' activities' in k or group+' cash flows' in k:
+            return group
+    if any(t in k for t in ('cash paid for interest','cash paid for income taxes','supplemental disclosure')):
+        return 'supplemental'
+    if context == 'review':
+        if any(t in k for t in ('depreciation','amortization','working capital','noncash','non cash',
+                                'receivables','accounts payable','net income','stock based compensation')): return 'operating'
+        if (any(t in k for t in ('purchase of property','purchases of property','sale of property','sales of property',
+                                'purchase of investment','purchases of investment','acquisition of business',
+                                'capital expenditure','payments to acquire','payments for investments'))): return 'investing'
+        if any(t in k for t in ('repayment','dividends paid','issuance of common stock','issuance of debt',
+                                'proceeds from debt','proceeds from borrowing','proceeds from issuance',
+                                'proceeds from issuing','shares repurchased')): return 'financing'
+        return 'review'
+    return context if context in ('operating','investing','financing') else 'review'
+
+
+def _classify_rows(sheet, typ: str):
+    rows = sheet.rows()
+    normalized = {norm(v) for v in rows.values()}
+    has_ca = 'total current assets' in normalized
+    has_cl = 'total current liabilities' in normalized
+    ctx = 'assets' if typ=='balance' else ('revenue' if typ=='income' else 'operating')
+    current = ''
+    results = []
+    for row,label in rows.items():
+        if row <= 3: continue
+        key = norm(label)
+        has_content = any(sheet.has_value(row,c) or (row,c) in sheet.existing
+                          for c in range(3,max(sheet.periods().values(),default=3)+2))
+        # The existing filing section captions provide context for poorly named
+        # company-specific items; once standardized, captions supply it again.
+        if typ == 'balance':
+            if key in ('assets','current assets','noncurrent assets'):
+                ctx = 'assets';current='current' if key == 'current assets' else 'noncurrent' if key=='noncurrent assets' else ''
+            elif key in ('liabilities','current liabilities','noncurrent liabilities'):
+                ctx = 'liab';current='current' if key == 'current liabilities' else 'noncurrent' if key == 'noncurrent liabilities' else ''
+            elif key in ('equity','stockholders equity','shareholders equity'): ctx='equity';current=''
+            elif key in ('additional sec line items review','uncategorized items requiring review'): ctx='review'
+            elif key=='total current assets':ctx='assets';current='noncurrent'
+            elif key=='total current liabilities':ctx='liab';current='noncurrent'
+            elif key=='total assets':ctx='liab';current=''
+            elif key=='total liabilities':ctx='equity';current=''
+        elif typ=='income':
+            if key in ('revenues','revenue'):ctx='revenue'
+            elif key in ('expenses','operating expenses','operating expenses and other costs'):ctx='opex'
+            elif key=='cost of revenue':ctx='cost'
+            elif key=='gross profit':ctx='gross'
+            elif key=='operating profit':ctx='operating_profit'
+            elif key in ('other income and taxes','other income expenses','other income and expenses') or (key=='other' and not has_content):ctx='nonop'
+            elif key in ('additional sec line items review','uncategorized items requiring review','uncategorized items review'):ctx='review'
+        else:
+            if key in ('cash flows from operating activities','operating activities'):ctx='operating'
+            elif key in ('cash flows from investing activities','investing activities'):ctx='investing'
+            elif key in ('cash flows from financing activities','financing activities'):ctx='financing'
+            elif key in ('additional sec line items review','uncategorized items requiring review','uncategorized items review'):ctx='review'
+        # Preserve every labeled data item, but replace old section captions.
+        if _is_heading(label) and not has_content: continue
+        if typ == 'balance': group=_balance_bucket(label,ctx,current,has_ca,has_cl)
+        elif typ == 'income': group=_income_bucket(label,ctx)
+        else: group=_cashflow_bucket(label,ctx)
+        kind = _item_kind(label,typ)
+        results.append((row,label,group,kind))
+    return results,has_ca,has_cl
+
+
+def _section_sort(typ: str, rows, has_ca=False, has_cl=False):
+    if typ=='balance':
+        rank = {'assets_current':10,'assets_noncurrent':20,'assets_other':20,'assets_total':29,
+                'liab_current':30,'liab_noncurrent':40,'liab_other':40,'liab_total':49,
+                'mezzanine':50,'equity':60,'balance_total':70,'checks':80,'review':90}
+    elif typ=='income':
+        rank = {x:i*10 for i,x in enumerate(('revenue','cost','gross','opex','operating_profit',
+                'nonop','pretax','taxes','netincome','eps','shares','checks','review'),1)}
+    else:
+        rank = {x:i*10 for i,x in enumerate(('operating','investing','financing',
+                'reconciliation','supplemental','checks','review'),1)}
+    def key(item):
+        old_row,label,group,kind = item
+        # Totals come after their components in every section, including cashflow.
+        kind_order = 3 if kind=='grand' else 2 if kind=='subtotal' else 0
+        if typ=='income' and group=='netincome':
+            norm_label=norm(label)
+            if 'attributable to' in norm_label and 'noncontrolling' not in norm_label:kind_order=3
+            elif 'noncontrolling' in norm_label:kind_order=1
+            elif 'consolidated' in norm_label:kind_order=0
+            else:kind_order=2
+        if typ=='balance' and group=='equity' and kind in ('subtotal','grand'):
+            kind_order=3 if norm(label)=='total equity' else 2
+        return (rank.get(group,99),kind_order,_sort_priority(label,typ,group),old_row)
+    return sorted(rows,key=key)
+
+
+def _section_headings(typ: str, group: str, seen: set[str], has_ca: bool, has_cl: bool) -> list[str]:
+    headings = []
+    if typ=='balance':
+        if group.startswith('assets') and 'ASSETS' not in seen:headings.append('ASSETS')
+        if group=='assets_current' and has_ca:headings.append('CURRENT ASSETS')
+        if group=='assets_noncurrent' and has_ca:headings.append('NONCURRENT ASSETS')
+        if group.startswith('liab') and 'LIABILITIES' not in seen:headings.append('LIABILITIES')
+        if group=='liab_current' and has_cl:headings.append('CURRENT LIABILITIES')
+        if group=='liab_noncurrent' and has_cl:headings.append('NONCURRENT LIABILITIES')
+        headings += {'mezzanine':['MEZZANINE EQUITY'],'equity':["STOCKHOLDERS' EQUITY"],
+                     'checks':['RECONCILIATION CHECKS'],'review':['UNCATEGORIZED ITEMS — REVIEW']}.get(group,[])
+    elif typ=='income':
+        heading = {'revenue':'REVENUE','cost':'COST OF REVENUE','gross':'GROSS PROFIT',
+                   'opex':'OPERATING EXPENSES AND OTHER COSTS','operating_profit':'OPERATING PROFIT',
+                   'nonop':'OTHER INCOME AND EXPENSES','pretax':'PRETAX INCOME',
+                   'taxes':'INCOME TAXES','netincome':'NET INCOME',
+                   'eps':'EARNINGS PER SHARE','shares':'WEIGHTED-AVERAGE SHARES',
+                   'checks':'RECONCILIATION CHECKS','review':'UNCATEGORIZED ITEMS — REVIEW'}.get(group)
+        if heading:headings.append(heading)
+    else:
+        heading = {'operating':'OPERATING ACTIVITIES','investing':'INVESTING ACTIVITIES',
+                   'financing':'FINANCING ACTIVITIES','reconciliation':'CASH RECONCILIATION',
+                   'supplemental':'SUPPLEMENTAL DISCLOSURES','checks':'RECONCILIATION CHECKS',
+                   'review':'UNCATEGORIZED ITEMS — REVIEW'}.get(group)
+        if heading:headings.append(heading)
+    return [h for h in headings if h not in seen]
+
+
+def _new_heading_row(row: int, title: str, last_col: int, styles: dict[str,int]) -> str:
+    text = escape(title)
+    # Continuous deep-navy band; no merges that could break nearby period cells.
+    cells = [f'<c r="B{row}" s="{styles["section_label"]}" t="inlineStr"><is><t>{text}</t></is></c>']
+    cells.extend(f'<c r="{col_name(c)}{row}" s="{styles["section_number"]}"/>' for c in range(3,last_col+1))
+    return f'<row r="{row}" ht="19" customHeight="1">'+''.join(cells)+'</row>'
+
+
+def _update_formula_rows(formula: str, row_map: dict[int,int]) -> str:
+    """Update existing Excel formula refs and preserve original SUM components."""
+    single_sum = re.compile(r'\bSUM\(\s*(\$?[A-Z]{1,3})(\$?)(\d+):(\$?[A-Z]{1,3})(\$?)(\d+)\s*\)', re.I)
+    protected = []
+    def sum_replace(m):
+        first_col, first_row = col_number(m[1].lstrip('$')), int(m[3])
+        last_col, last_row = col_number(m[4].lstrip('$')), int(m[6])
+        if first_col != last_col or last_row < first_row or last_row-first_row > 300:
+            return m[0]
+        refs = [m[1]+m[2]+str(row_map[i]) for i in range(first_row,last_row+1) if i in row_map]
+        if not refs: return m[0]
+        index = len(protected)
+        protected.append('SUM('+','.join(refs)+')')
+        return f'__SEC_RANGE_{index}__'
+    formula = single_sum.sub(sum_replace, formula)
+    def replace(m):
+        old = int(m['row'])
+        if old not in row_map: return m[0]
+        return f'{m["colabs"]}{m["col"]}{m["rowabs"]}{row_map[old]}'
+    formula = FORMULA_REF.sub(replace, formula)
+    for i,value in enumerate(protected):
+        formula = formula.replace(f'__SEC_RANGE_{i}__',value)
+    return formula
+
+
+def _restyle_data_row(source: str, old_row: int, new_row: int, kind: str,
+                      label: str, last_col: int, value_columns: set[int], styles: dict[str,int],
+                      row_map: dict[int,int]) -> str:
+    kind = 'review' if kind=='review' else kind
+    base = 'total' if kind=='grand' else 'subtotal' if kind=='subtotal' else 'review' if kind=='review' else ''
+    m = re.match(r'<row\b[^>]*>',source)
+    if not m:raise ValueError('Invalid row XML')
+    opening = re.sub(r'(\br=")[0-9]+(")',lambda m:m[1]+str(new_row)+m[2],m[0],count=1)
+    opening = re.sub(r'\bspans="[^"]*"','',opening)
+    if kind in ('grand','subtotal'):
+        opening = re.sub(r'\s+ht="[^"]*"|\s+customHeight="[^"]*"','',opening[:-1])+' ht="19" customHeight="1">'
+    cells = {}
+    for match in CELL_RE.finditer(source[len(m[0]):-len('</row>')]):
+        c = col_number(match[1]);cell = match[0]
+        if c in value_columns and c-1 in value_columns:raise ValueError('Duplicate period columns')
+        # Rebuild comparison formulas after reorder using the new row addresses.
+        if c > 2 and c not in value_columns:continue
+        if c == 2:role = base+'_label' if base else 'label'
+        elif 'per share' in norm(label) and 'percent' not in norm(label):role='per_share'
+        else:role = base+'_number' if base else 'number'
+        style=styles.get(role,styles['number'])
+        # Normalize OOXML attribute order for idempotent offline formatting.
+        old_open = re.match(r'<c\b[^>]*>',cell)
+        if not old_open:raise ValueError('Invalid cell XML')
+        o = old_open[0]
+        extras = [(k,v) for k,v in re.findall(r'\s+([A-Za-z_:][A-Za-z0-9_:]*)="([^"]*)"',o)
+                  if k not in ('r','s')]
+        opener = f'<c r="{col_name(c)}{new_row}" s="{style}"' + ''.join(
+            f' {k}="{v}"' for k,v in extras) + ('/>' if o.endswith('/>') else '>')
+        cell = opener + cell[len(o):]
+        def formula_update(f):
+            old = f[2]
+            return f[1]+escape(_update_formula_rows(old,row_map))+f[3]
+        cell = re.sub(r'(<f(?:\s+[^>]*)?>)(.*?)(</f>)',formula_update,cell,flags=re.S)
+        cells[c]=cell
+    for col in range(2,last_col+1):
+        if col in cells:continue
+        if col == 2:style = styles[base+'_label'] if base else styles['label']
+        elif col in value_columns:
+            style = styles[base+'_number'] if base else (styles['per_share'] if 'per share' in norm(label) else styles['number'])
+        else:
+            style = styles[base+'_percent'] if base else styles['percent']
+        cells[col]=f'<c r="{col_name(col)}{new_row}" s="{style}"/>'
+    return opening+''.join(cells[c] for c in sorted(cells))+'</row>'
+
+
+def standardize_statement(sheet, typ: str, style_ids: dict[str,int]) -> int:
+    """Reorder EXISTING statement data, without changing its stored financial facts.
+
+    Only data rows are rearranged; values are copied intact, existing source
+    formulas are row-remapped, and the QoQ/YoY formulas are rebuilt.
+    """
+    # Materialize SEC-updated values and any inserted future columns first.
+    sheet.original = sheet.output()
+    sheet.pending.clear();sheet.values.clear();sheet.existing.clear();sheet.styles.clear();sheet._read()
+    sheet.original = _remap_sheet_xml(sheet.original,lambda col:col)
+    sheet.values.clear();sheet.existing.clear();sheet.styles.clear();sheet._read()
+    items,has_ca,has_cl = _classify_rows(sheet,typ)
+    ordered = _section_sort(typ,items,has_ca,has_cl)
+    # Retain numeric or formula-only rows even without a label (append at review).
+    known_rows={r for r,_,_,_ in ordered}
+    root=ET.fromstring(sheet.original)
+    for r in root.findall('.//{%s}sheetData/{%s}row' % (M,M)):
+        index=int(r.get('r','0'))
+        if index <=3 or index in known_rows:continue
+        if any(c.get('r','').split('!')[-1][:-len(str(index))] not in ('A','B') and
+               (c.find('{%s}v' % M) is not None or c.find('{%s}f' % M) is not None)
+               for c in r.findall('{%s}c' % M)):
+            ordered.append((index,f'UNLABELED ORIGINAL ROW {index}','review','detail'))
+    # Blank templates still show a clean scaffold, so a touch-created XLSX
+    # becomes immediately usable without waiting for EDGAR's next filing.
+    if not ordered:ordered=[]
+    last_col=max([4,*(c+1 for c in sheet.periods().values())])
+    value_columns=set(sheet.periods().values())
+    if not value_columns:value_columns=set(range(3,last_col+1,2))
+    layout=[];seen=set();previous_group=None;row=4;row_map={}
+    for old,label,group,kind in ordered:
+        if group!=previous_group:
+            row += 1
+            for heading in _section_headings(typ,group,seen,has_ca,has_cl):
+                layout.append((row,'heading',heading,None,None))
+                seen.add(heading);row+=1
+        row_map[old]=row
+        layout.append((row,'data',label,old,'review' if group=='review' else kind))
+        row +=1
+        previous_group=group
+    # If input rows were already styled and sorted, equal XML is a true no-op.
+    source=sheet.original
+    sd=re.search(r'<sheetData\b[^>]*>(.*?)</sheetData>',source,re.S)
+    if not sd:raise ValueError(f'{sheet.name}: sheetData element is missing')
+    existing_by_row={int(m[1]):m[0] for m in ROW_RE.finditer(sd[1])}
+    old_top=[xml for r,xml in sorted(existing_by_row.items()) if r<=3]
+    out=[]
+    for r,what,label,old,kind in layout:
+        if what=='heading':out.append(_new_heading_row(r,label,last_col,style_ids))
+        else:
+            orig=existing_by_row.get(old)
+            if orig is None:raise ValueError(f'Missing original data row {old}')
+            out.append(_restyle_data_row(orig,old,r,kind,label,last_col,value_columns,
+                                         style_ids,row_map))
+    # Set row-3 caption and style, preserving its existing period labels.
+    if old_top:
+        fixed=[]
+        for orig in old_top:
+            if re.search(r'<row\b[^>]*\br="3"',orig):
+                orig=re.sub(r'<c\b[^>]*\br="B3"[^>]*(?:/>|>.*?</c>)',
+                    f'<c r="B3" s="{style_ids["header_label"]}" t="inlineStr"><is><t>Line Item</t></is></c>',orig,count=1,flags=re.S)
+                if 'r="B3"' not in orig:orig=orig.replace('</row>',f'<c r="B3" s="{style_ids["header_label"]}" t="inlineStr"><is><t>Line Item</t></is></c></row>')
+                def style_header(m):
+                    c=col_number(m[1])
+                    index = (style_ids['header_label'] if c==2 else style_ids['header_number'])
+                    cell = re.sub(r'\s+s="[^"]+"','',m[0],count=1)
+                    return cell.replace('<c ',f'<c s="{index}" ',1)
+                orig=CELL_RE.sub(style_header,orig)
+            fixed.append(orig)
+        old_top=fixed
+    body=''.join(old_top+out)
+    result=source[:sd.start(1)]+body+source[sd.end(1):]
+    # Reset body-range coordinate metadata that would point to old row positions.
+    result=re.sub(r'(<dimension\b[^>]*\bref=")[^"]+("[\s/>])',
+                  lambda m:m[1]+f'B1:{col_name(last_col)}{max(row-1,3)}'+m[2],result,count=1)
+    # Superseded row-spanning template merges must not cover new section bands.
+    result = re.sub(r'<mergeCell\b[^>]*\bref="[A-Z]+(\d+):[A-Z]+(\d+)"[^>]*/>',
+                    lambda m: m[0] if int(m[1]) <= 3 and int(m[2]) <= 3 else '',result)
+    result = re.sub(r'<mergeCells\b[^>]*>\s*</mergeCells>', '',result)
+    if '<mergeCells' in result:
+        number = len(re.findall(r'<mergeCell\b',result))
+        result = re.sub(r'(<mergeCells\b[^>]*\bcount=")[0-9]+(")',
+                        lambda m:m[1]+str(number)+m[2],result,count=1)
+    # Workbook drawings can be harmless empty spreadsheet artifacts. Keep their
+    # relationships intact; other cell-range-linked objects require a dedicated
+    # reanchoring implementation, so refuse rather than silently damage them.
+    if any(token in result for token in ('<tableParts ', '<hyperlinks>', '<dataValidations')):
+        raise ValueError(f'{sheet.name}: tables, hyperlinks or validations require manual row-migration handling')
+    ET.fromstring(result)
+    different = result!=sheet.original
+    if different:
+        sheet.original=result
+        sheet.values.clear();sheet.existing.clear();sheet.styles.clear();sheet._read()
+        sheet.layout_changed=True
+    sheet.report_styles=style_ids
+    sheet.row_roles={new_row: ('review' if kind=='review' else kind)
+                     for new_row,what,_,_,kind in layout if what=='data'}
+    return len(ordered) if different else 0
 
 
 def sheet_type(name: str) -> str | None:
@@ -1027,6 +1602,26 @@ def load_xlsx_units(directory: Path, ticker: str, path: Path, sheets: dict[str, 
     if isinstance(chosen, dict):
         return {name: divisor(chosen.get(name, guessed.get(name, Decimal(1)))) for name in sheets}
     return {name: divisor(chosen) for name in sheets}
+
+
+
+def remember_xlsx_units(directory: Path, ticker: str, path: Path,
+                        units: dict[str, Decimal], *, dry_run=False) -> None:
+    """Persist inferred legacy scaling before removing source unit captions.
+
+    Do not overwrite any user-provided mapping. The config is ordinary public
+    metadata, unlike the separate private SEC user_agent.conf.
+    """
+    if dry_run:return
+    config_file=directory/'edgar_xlsx_units.json'
+    config=json.loads(config_file.read_text(encoding='utf-8')) if config_file.exists() else {}
+    if not isinstance(config,dict):raise ValueError('edgar_xlsx_units.json must be a JSON object')
+    if path.name in config or ticker in config:return
+    unique=set(units.values())
+    config[path.name]=(str(next(iter(unique))) if len(unique)==1 else
+                      {name:str(divisor) for name,divisor in units.items()})
+    write_json_atomic(config_file,config)
+    LOG.info('%s: persisted numeric unit scaling in edgar_xlsx_units.json',path.name)
 
 
 def period_sort_key(period: str) -> tuple[int, int]:
@@ -1353,10 +1948,13 @@ def update_workbook(path: Path, ticker: str, filings: list[Filing], facts, label
                                         "problem": "balance_sheet_does_not_reconcile", "suggested_concept": "",
                                         "filing_url": filings[0].source_url if filings else ""})
     for sheet in book.sheets.values():
-        if sheet_type(sheet.name):
+        typ = sheet_type(sheet.name)
+        if typ:
             sheet.ensure_change_headers()
+            standardize_statement(sheet, typ, book.report_styles)
             sheet.ensure_percent_formulas()
     book.save(dry_run=args.dry_run, backup=not args.no_backup)
+    remember_xlsx_units(Path(args.directory), ticker, path, units, dry_run=args.dry_run)
     return changes, reviews
 
 
@@ -1379,6 +1977,7 @@ def format_only(args):
         if args.owner and owner != args.owner: continue
         try:
             wb = Workbook(path)
+            units = load_xlsx_units(directory, ticker, path, wb.sheets)
             if wb.is_placeholder:
                 LOG.info("%s: initializing blank 3-sheet workbook%s", path.name,
                          " (dry-run only)" if args.dry_run else "")
@@ -1388,13 +1987,17 @@ def format_only(args):
             for sheet in wb.sheets.values():
                 sheet.seed_periods(reference)
                 sheet.ensure_change_headers()
+                typ = sheet_type(sheet.name)
+                if typ:
+                    standardize_statement(sheet, typ, wb.report_styles)
                 sheet.ensure_percent_formulas()
-            changed = wb.changed()
-            wb.save(dry_run=args.dry_run, backup=not args.no_backup)
-            if changed:
+            changed = wb.changed() if args.dry_run else False
+            wrote = wb.save(dry_run=args.dry_run, backup=not args.no_backup)
+            remember_xlsx_units(directory, ticker, path, units, dry_run=args.dry_run)
+            if changed or wrote:
                 count += 1
-                LOG.info('%s: %s percentage-change columns', path.name,
-                         'would add' if args.dry_run else 'added')
+                LOG.info('%s: %s standard account order, formatting and percentage columns', path.name,
+                         'would apply' if args.dry_run else 'applied')
         except Exception:
             LOG.exception('Failed formatting %s; other workbooks continue', path.name)
     LOG.info('Offline format-only: %d workbooks %s', count,
@@ -1457,7 +2060,7 @@ def run_once(args):
                 previous = recorded.get(path.name, {})
                 same_filings = previous.get("accessions", []) == current_accns
                 same_settings = (bool(previous.get("discovered_rows")) == bool(args.discover_rows)
-                                 and previous.get("layout_version") == 2)
+                                 and previous.get("layout_version") == REPORT_LAYOUT_VERSION)
                 mapping_file = directory / args.mappings_file
                 mapping_mtime = mapping_file.stat().st_mtime if mapping_file.exists() else None
                 same_mapping = previous.get("mapping_mtime") == mapping_mtime
@@ -1501,7 +2104,7 @@ def run_once(args):
                         LOG.info("[REVIEW] %s: %s (%s)", item["sheet"], item["line_item"], item["problem"])
                 if not args.dry_run and can_mark_processed:
                     recorded[path.name] = {"accessions": current_accns, "discovered_rows": bool(args.discover_rows),
-                                           "mapping_mtime": mapping_mtime, "layout_version": 2,
+                                           "mapping_mtime": mapping_mtime, "layout_version": REPORT_LAYOUT_VERSION,
                                            "processed_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
                     state[ticker] = {"files": recorded}
         except Exception:
@@ -1553,7 +2156,7 @@ def load_sec_user_agent(path: Path) -> str:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Monitor SEC EDGAR and incrementally fill three-sheet XLSX spreads with QoQ / YoY formulas.")
+    parser = argparse.ArgumentParser(description="Monitor SEC EDGAR and standardize three-sheet XLSX spreads with a consistent account hierarchy and QoQ / YoY formulas.")
     parser.add_argument("--directory", default=".", help="Folder with TICKER_COMPANY TITLE_GTL.xlsx workbooks")
     parser.add_argument("--user-agent", default=None, help="Override User-Agent from config file / environment (avoid on shared servers: command lines may be visible)")
     parser.add_argument("--user-agent-file", default=None, help="Path to private config; defaults to user_agent.conf beside this script")
@@ -1564,7 +2167,7 @@ def main(argv=None):
     parser.add_argument("--discover-rows", action="store_true", default=True, help="Add new main-statement XBRL fields (enabled by default)")
     parser.add_argument("--no-discover-rows", action="store_false", dest="discover_rows", help="Disable discovery of new statement rows")
     parser.add_argument("--max-new-rows", type=int, default=0, help="Max discovered rows per statement, 0 (default) = unlimited")
-    parser.add_argument("--format-only", action="store_true", help="Add percentage columns to existing XLSX files offline, without contacting EDGAR")
+    parser.add_argument("--format-only", action="store_true", help="Offline migration: organize existing statement rows and add percentage columns, without contacting EDGAR")
     parser.add_argument("--dry-run", action="store_true", help="Analyze but do not modify workbooks or logs")
     parser.add_argument("--no-backup", action="store_true", help="Disable timestamped original workbook backups")
     parser.add_argument("--recheck-existing", action="store_true", help="Reprocess even when no new SEC filing is detected")

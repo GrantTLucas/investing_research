@@ -3,8 +3,9 @@
 *.json
 *.Jason
 *.csv
-
+*.gz
 # Virtual environments
+.edgar_cache/
 venv/
 .venv/
 env/
